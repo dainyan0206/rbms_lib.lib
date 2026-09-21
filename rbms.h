@@ -40,6 +40,8 @@ public:
         if (id < 0 || id >= _motor_num) return 0.0f;
         return _output_torques[id];
     }
+    //モーター動かさずにプログラム内の角度のみ変更
+    void force_set_angle(int id, float new_angle = 0.0f);
 
 private:
     void control_thread_entry();
