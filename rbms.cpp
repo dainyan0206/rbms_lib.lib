@@ -362,3 +362,14 @@ bool rbms::handle_message(const CANMessage &msg) {
     }
     return false;
 }
+
+//モーターを動かさずにプログラム内の角度のみ変更
+void rbms::force_set_angle(int id, float new_angle) {
+    if (id < 0 || id >= _motor_num) return;
+    _data_mutex.lock();
+    _pid_states[id].accumulated_angle = new_angle;
+    _pid_states[id].pos_integral = 0.0f;
+    _pid_states[id].pos_prev_err = 0.0f;
+    _target_angles[id] = new_angle;
+    _data_mutex.unlock();
+}
