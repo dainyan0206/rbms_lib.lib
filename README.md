@@ -31,11 +31,6 @@ RoboMaster の M2006 P36(C610 電調)/ M3508 P19(C620 電調)を、mbed から C
 
 `set_lqr_params()` を呼ばない限り、動作は従来の PID のままです。
 
-### 修正したバグ
-
-- `force_set_angle()`:`if(id>0 || ...)` を `if(id<0 || ...)` に修正(id = 0 以外がすべて弾かれていた)
-- `_new_data_mask` がコンストラクタで初期化されていなかったので、`0` で初期化
-
 ## LQR とは
 
 LQR(Linear Quadratic Regulator)は、現代制御の最適制御の手法の1つです。
