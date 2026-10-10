@@ -24,12 +24,17 @@ RoboMaster の M2006 P36(C610 電調)/ M3508 P19(C620 電調)を、mbed から C
 
 | 項目 | 内容 |
 |---|---|
-| `set_lqr_params(J_load, u_max, theta_max, omega_max, zeta_max, eps_max)` | LQR の設計パラメータからゲインを自動計算して設定する |
-| `disable_lqr()` | 位置制御の LQR を無効にして、従来の PID に戻す |
+| `set_lqr_params(id, J_load, u_max, theta_max, omega_max, zeta_max, eps_max)` | **モーター ID ごとに**、LQR の設計パラメータからゲインを自動計算して設定する |
+| `disable_lqr(id)` | その ID の LQR(位置・速度とも)を無効にして、従来の PID に戻す |
 | 速度モード | ゲインを LQR の式で決める(制御の形は従来どおりの PI) |
 | 位置モード | 目標に近づいたら、位置・速度の状態フィードバック(位置 LQR)で指令値を直接出す |
 
-`set_lqr_params()` を呼ばない限り、動作は従来の PID のままです。
+`set_lqr_params()` を呼ばない ID は、動作が従来の PID のままです。LQR のゲインは ID ごとに保持されるので、負荷の違う関節ごとに別の値を設定できます。
+
+### 修正したバグ
+
+- `force_set_angle()`:`if(id>0 || ...)` を `if(id<0 || ...)` に修正(id = 0 以外がすべて弾かれていた)
+- `_new_data_mask` がコンストラクタで初期化されていなかったので、`0` で初期化
 
 ## LQR とは
 
@@ -91,7 +96,7 @@ $$k_1 = \frac{u_{\max}}{x_{1,\max}},\qquad k_2 = \sqrt{\left(\frac{u_{\max}}{x_{
 | $x_{2,\max}$ | `omega_max` [rad/s] | `eps_max` [rad/s] |
 | 制御則 | $u = k_1(\theta_{ref}-\theta) - k_2\,\omega$ | $u = k_1\int(\omega_{ref}-\omega)dt + k_2(\omega_{ref}-\omega)$ |
 
-速度制御は、$k_2$ が比例ゲイン、$k_1$ が積分ゲインにあたる **PI 制御の形**です(既存の `pid_calculate` をそのまま使い、`_kp`、`_ki` の値だけを LQR の式で決めています)。
+速度制御は、$k_2$ が比例ゲイン、$k_1$ が積分ゲインにあたる **PI 制御の形**です(既存の `pid_calculate` をそのまま使い、ゲインだけを LQR の式で決めています。ゲインは ID ごとに保持します)。
 
 ### コード内の単位
 
@@ -101,21 +106,23 @@ $$k_1 = \frac{u_{\max}}{x_{1,\max}},\qquad k_2 = \sqrt{\left(\frac{u_{\max}}{x_{
 |---|---|---|
 | `_lqr_pos_k1` | カウント/deg | $k_1 \times \pi/180$ |
 | `_lqr_pos_k2` | カウント/rpm | $k_2 \times 2\pi/60$ |
-| `_ki`(速度) | カウント/(rpm·s) | $k_1 \times 2\pi/60$ |
-| `_kp`(速度) | カウント/rpm | $k_2 \times 2\pi/60$ |
+| `_lqr_spd_ki`(速度) | カウント/(rpm·s) | $k_1 \times 2\pi/60$ |
+| `_lqr_spd_kp`(速度) | カウント/rpm | $k_2 \times 2\pi/60$ |
 
 ## 使い方
 
 ```cpp
-rbms motor(can, false, 1);   // false: M2006, 1: モーター数
+rbms motor(can, false, 2);   // false: M2006, 2: モーター数
 
-// 仮の値です。実機に合わせて調整してください
-motor.set_lqr_params(0.01f,    // J_load    [kg·m²]  負荷慣性(仮置き)
+// 仮の値です。実機に合わせて調整してください(ID ごとに別の値を設定できます)
+motor.set_lqr_params(0,        // id
+                     0.01f,    // J_load    [kg·m²]  負荷慣性(仮置き)
                      5000.0f,  // u_max     [カウント] 使いたい最大指令値
                      0.5f,     // theta_max [rad]    許容する角度ずれ
                      10.0f,    // omega_max [rad/s]  許容する角速度
                      0.5f,     // zeta_max  [rad]    速度誤差の積分の許容値
                      2.0f);    // eps_max   [rad/s]  許容する速度誤差
+motor.set_lqr_params(1, 0.02f, 4000.0f, 0.3f, 8.0f, 0.4f, 5.0f);   // id 1 は別の値
 motor.spd_control();
 ```
 
@@ -124,13 +131,13 @@ motor.spd_control();
 従来の PID に戻す場合は、次のとおりです。
 
 ```cpp
-motor.disable_lqr();                       // 位置制御を PID に戻す
-motor.set_pid_gains(kp, ki, kd);           // 速度側のゲインを設定し直す
+motor.disable_lqr(0);                      // ID 0 の位置・速度を従来の PID に戻す
+motor.set_pid_gains(kp, ki, kd);           // 従来の速度 PID のゲインを変えたい場合(全 ID 共通)
 ```
 
 ## 動作の仕様
 
-- **速度モード**:LQR の式で決めた `_kp`、`_ki`(`_kd` = 0)で `pid_calculate` が動きます
+- **速度モード**:LQR が有効な ID は、その ID の LQR ゲイン(PI、kd = 0)で `pid_calculate` が動きます。無効な ID は従来の `_kp`、`_ki`、`_kd` です
 - **位置モード**
   - `accel_limit` が設定されていて、誤差が `SETTLING_THRESHOLD`(25°)より大きいとき:従来の台形プロファイルで目標速度を作り、速度 PI(LQR のゲイン)で追従します
   - それより近いとき:位置 LQR が、`k1 × 角度ずれ − k2 × 速度` で指令値を直接出します(速度 PI は使いません)
