@@ -17,7 +17,7 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
         _kt_count = 1.8e-4f;
     }
     for(int i = 0; i < 8; i++) {
-     
+
         _control_modes[i] = SPD_MODE;
         _target_speeds[i] = 0;
         _target_torques[i] = 0;
@@ -46,11 +46,14 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
         _torque_limits[i] = 10000;
     }
     _new_data_mask = 0;
-
-
-    _lqr_enabled = false;
-    _lqr_pos_k1 = 0.0f;
-    _lqr_pos_k2 = 0.0f;
+    //lqr用
+    for(int i = 0; i < 8; i++){
+        _pid_states[i]._lqr_enabled = false;
+        _pid_states[i]._lqr_pos_k1 = 0.0f;
+        _pid_states[i]._lqr_pos_k2 = 0.0f;
+        _pid_states[i]._lqr_spd_kp = 0.0f;
+        _pid_states[i]._lqr_spd_ki = 0.0f;
+    }
 }
 
 void rbms::set_control_mode(int id, ControlMode mode) {
@@ -133,7 +136,8 @@ void rbms::set_torque_limit(int id, int max_torque){
     _data_mutex.unlock();
 }
 
-void rbms::set_lqr_params(float j_load, float u_max, float theta_max, float omega_max, float zeta_max, float eps_max){
+void rbms::set_lqr_params(int id,float j_load, float u_max, float theta_max, float omega_max, float zeta_max, float eps_max){
+    if(id < 0 || id>=_motor_num) return;
     if(j_load<=0.0f || u_max<=0.0f || theta_max<=0.0f || omega_max<=0.0f || zeta_max<=0.0f || eps_max<=0.0f) return;
 
     const float DEG2RAD = 0.01745329f;   // rad/deg
@@ -149,26 +153,34 @@ void rbms::set_lqr_params(float j_load, float u_max, float theta_max, float omeg
     float s2 = std::sqrt((u_max / eps_max) * (u_max / eps_max) + 2.0f * s1 * j_over_kt);
 
     _data_mutex.lock();
-    _lqr_pos_k1 = p1 * DEG2RAD;
-    _lqr_pos_k2 = p2 * RPM2RASA;
-    _ki = s1 * RPM2RASA;
-    _kp = s2 * RPM2RASA;
-    _kd = 0.0f;
-    _lqr_enabled = true;
+    _pid_states[id]._lqr_pos_k1 = p1 * DEG2RAD;
+    _pid_states[id]._lqr_pos_k2 = p2 * RPM2RASA;
+    _pid_states[id]._lqr_spd_ki = s1 * RPM2RASA;
+    _pid_states[id]._lqr_spd_kp = s2 * RPM2RASA;
+    _pid_states[id]._lqr_enabled = true;
     _data_mutex.unlock();
 }
 
-void rbms::disable_lqr(){
+void rbms::disable_lqr(int id){
+    if(id < 0 || id>=_motor_num) return;
     _data_mutex.lock();
-    _lqr_enabled = false;
+    _pid_states[id]._lqr_enabled = false;
     _data_mutex.unlock();
 }
 
 float rbms::pid_calculate(int id, float target, float current, float dt) {
+    // LQRが有効なモーターは、そのidのゲイン(PI)を使う。無効なら従来のゲイン
+    float kp = _kp, ki = _ki, kd = _kd;
+    if (_pid_states[id]._lqr_enabled) {
+        kp = _pid_states[id]._lqr_spd_kp;
+        ki = _pid_states[id]._lqr_spd_ki;
+        kd = 0.0f;
+    }
+
     float error = target - current;
     _pid_states[id].integral += (error + _pid_states[id].prev_err) * dt / 2.0f;
 
-    float integral_limit = _motor_max / (_ki > 0.0f ? _ki : 1.0f); 
+    float integral_limit = _motor_max / (ki > 0.0f ? ki : 1.0f); 
     if (_pid_states[id].integral > integral_limit) {
         _pid_states[id].integral = integral_limit;
     } else if (_pid_states[id].integral < -integral_limit) {
@@ -176,7 +188,7 @@ float rbms::pid_calculate(int id, float target, float current, float dt) {
     }
 
     float derivative = (error - _pid_states[id].prev_err) / dt;
-    float out = (_kp * error) + (_ki * _pid_states[id].integral) + (_kd * derivative);
+    float out = (kp * error) + (ki * _pid_states[id].integral) + (kd * derivative);
     _pid_states[id].prev_err = error;
     return out;
 }
@@ -281,8 +293,8 @@ void rbms::control_thread_entry() {
                             raw_target_rpm = profile_rpm;
                         }
                         //lqr用
-                        else if(_lqr_enabled){
-                            direct_out = _lqr_pos_k1 * error_angle - _lqr_pos_k2 * current_rpm;
+                        else if(_pid_states[id]._lqr_enabled){
+                            direct_out = _pid_states[id]._lqr_pos_k1 * error_angle - _pid_states[id]._lqr_pos_k2 * current_rpm;
                             direct_trq = true;
                             bypass_accel_limit = true;
                         } 
@@ -423,7 +435,7 @@ bool rbms::handle_message(const CANMessage &msg) {
 }
 //モーターを動かさずにプログラム内の角度のみ変更
 void rbms::force_set_angle(int id, float new_angle){
-    if(id<=0 || id>= _motor_num) return;
+    if(id<0 || id>= _motor_num) return;
     _data_mutex.lock();
     _pid_states[id].accumulated_angle = new_angle;
     _pid_states[id].pos_integral = 0.0f;
