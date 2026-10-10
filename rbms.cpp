@@ -9,12 +9,15 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
         _kp = 35.0f; _ki = 50.0f; _kd = 0.0f;
         _kp_p = 5.0f; _ki_p = 0.0f; _kd_p = 0.15f;
         _motor_max = 16384;
+        _kt_count = 3.66e-4f;
     } else { // M2006
         _kp = 15.0f; _ki = 12.0f; _kd = 0.0f;
         _kp_p = 4.5f; _ki_p = 0.0f; _kd_p = 0.25f;
         _motor_max = 10000;
+        _kt_count = 1.8e-4f;
     }
     for(int i = 0; i < 8; i++) {
+     
         _control_modes[i] = SPD_MODE;
         _target_speeds[i] = 0;
         _target_torques[i] = 0;
@@ -42,6 +45,12 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
     for(int i = 0; i < 8; i++){
         _torque_limits[i] = 10000;
     }
+    _new_data_mask = 0;
+
+
+    _lqr_enabled = false;
+    _lqr_pos_k1 = 0.0f;
+    _lqr_pos_k2 = 0.0f;
 }
 
 void rbms::set_control_mode(int id, ControlMode mode) {
@@ -121,6 +130,37 @@ void rbms::set_torque_limit(int id, int max_torque){
 
     _data_mutex.lock();
     _torque_limits[id] = max_torque;
+    _data_mutex.unlock();
+}
+
+void rbms::set_lqr_params(float j_load, float u_max, float theta_max, float omega_max, float zeta_max, float eps_max){
+    if(j_load<=0.0f || u_max<=0.0f || theta_max<=0.0f || omega_max<=0.0f || zeta_max<=0.0f || eps_max<=0.0f) return;
+
+    const float DEG2RAD = 0.01745329f;   // rad/deg
+    const float RPM2RASA = 0.10471976f;  // rad/s per  rpm
+    float j_over_kt = j_load / _kt_count;
+
+    //位置
+    float p1 = u_max / theta_max;
+    float p2 = std::sqrt((u_max / omega_max) * (u_max / omega_max) + 2.0f * p1 * j_over_kt);
+
+    //速度
+    float s1 = u_max / zeta_max;
+    float s2 = std::sqrt((u_max / eps_max) * (u_max / eps_max) + 2.0f * s1 * j_over_kt);
+
+    _data_mutex.lock();
+    _lqr_pos_k1 = p1 * DEG2RAD;
+    _lqr_pos_k2 = p2 * RPM2RASA;
+    _ki = s1 * RPM2RASA;
+    _kp = s2 * RPM2RASA;
+    _kd = 0.0f;
+    _lqr_enabled = true;
+    _data_mutex.unlock();
+}
+
+void rbms::disable_lqr(){
+    _data_mutex.lock();
+    _lqr_enabled = false;
     _data_mutex.unlock();
 }
 
@@ -212,6 +252,10 @@ void rbms::control_thread_entry() {
 
                     float raw_target_rpm = 0.0f;
                     bool bypass_accel_limit = false;
+                    //lqr用
+                    bool direct_trq = false;
+                    float direct_out = 0.0f;
+
 
                     if (mode == POS_MODE) {
                         float current_angle = _pid_states[id].accumulated_angle;
@@ -235,8 +279,15 @@ void rbms::control_thread_entry() {
 
                             if (error_angle < 0.0f) profile_rpm = -profile_rpm;
                             raw_target_rpm = profile_rpm;
-
-                        } else if(abs_error > DEAD_BAND){
+                        }
+                        //lqr用
+                        else if(_lqr_enabled){
+                            direct_out = _lqr_pos_k1 * error_angle - _lqr_pos_k2 * current_rpm;
+                            direct_trq = true;
+                            bypass_accel_limit = true;
+                        } 
+                        
+                        else if(abs_error > DEAD_BAND){
                             raw_target_rpm = pos_pid_calculate(id, target_a, current_angle, dt, limit);
                             bypass_accel_limit = true; 
                         } else {
@@ -265,9 +316,17 @@ void rbms::control_thread_entry() {
                     } else {
                         _pid_states[id].current_target_rpm = raw_target_rpm;
                     }
+                    //lqr用
+                    if(direct_trq){
+                        final_out = (int)direct_out;
 
-                    final_out = (int)pid_calculate(id, _pid_states[id].current_target_rpm, current_rpm, dt);
-
+                        _pid_states[id].integral = 0.0f;
+                        _pid_states[id].prev_err = 0.0f;
+                        _pid_states[id].current_target_rpm = current_rpm;
+                    }
+                    else{
+                        final_out = (int)pid_calculate(id, _pid_states[id].current_target_rpm, current_rpm, dt);
+                    }
                 } else {
                     final_out = target_t;
                     _pid_states[id].current_target_rpm = current_rpm;
@@ -292,13 +351,13 @@ int rbms::rbms_send() {
     _tx_msg_low.id = 0x200; _tx_msg_low.len = 8;
     _tx_msg_high.id = 0x1ff; _tx_msg_high.len = 8;
 
-    // 追加:送信フラグ（他方インスタンスのデータへのゼロ上書き干渉を防止）
+    // 送信フラグ（他方インスタンスのデータへのゼロ上書き干渉を防止）
     bool send_low = false;
     bool send_high = false;
 
     _data_mutex.lock();
     for(int i = 0; i < _motor_num; i++) {
-        int global_id = i + _id_offset; //追加:実機の物理IDインデックス(0~7)を算出
+        int global_id = i + _id_offset; //実機の物理IDインデックス(0~7)を算出
         int val = _output_torques[i];
 
         if (global_id < 4) {
@@ -313,7 +372,7 @@ int rbms::rbms_send() {
     }
     _data_mutex.unlock();
 
-    // 修正:データが存在する CAN メッセージのみを送信する
+    // データが存在する CAN メッセージのみを送信する
     bool success = true;
     if (send_low)  success = success && _can.write(_tx_msg_low);
     if (send_high) success = success && _can.write(_tx_msg_high);
@@ -362,10 +421,9 @@ bool rbms::handle_message(const CANMessage &msg) {
     }
     return false;
 }
-
 //モーターを動かさずにプログラム内の角度のみ変更
-void rbms::force_set_angle(int id, float new_angle) {
-    if (id < 0 || id >= _motor_num) return;
+void rbms::force_set_angle(int id, float new_angle){
+    if(id<=0 || id>= _motor_num) return;
     _data_mutex.lock();
     _pid_states[id].accumulated_angle = new_angle;
     _pid_states[id].pos_integral = 0.0f;
