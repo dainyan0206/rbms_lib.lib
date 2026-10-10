@@ -26,6 +26,11 @@ public:
     void set_accel_limit(int id, float max_accel);
     void set_torque_limit(int id, int max_torque);
 
+    //lqr
+    void set_lqr_params(float j_load,float u_max,float theta_max,float omega_max,float zeta_max,float eps_max);
+
+    void disable_lqr();
+
     bool handle_message(const CANMessage &msg) override;
     void spd_control();
     int rbms_send();
@@ -63,6 +68,13 @@ private:
 
     float _kp, _ki, _kd;
     float _kp_p, _ki_p, _kd_p;
+
+    //lqr用
+    bool _lqr_enabled;
+    float _kt_count;
+    float _lqr_pos_k1;
+    float _lqr_pos_k2;
+
 
     Thread _thread;
     Mutex _data_mutex;
