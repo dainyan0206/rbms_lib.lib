@@ -37,9 +37,17 @@ public:
     }
 
     int get_tqr(int id) {
-        if (id < 0 || id >= _motor_num) return 0.0f;
+        if (id < 0 || id >= _motor_num) return 0;
         return _output_torques[id];
     }
+
+    // ESCフィードバック電流（生のCAN値。アンペア換算ではない）
+    int get_current(int id);
+
+    // RLSによる速度応答モデル y[k] = a*y[k-1] + b*(current[k-1]/1000)
+    // 有効な推定値が得られた場合 true を返す
+    bool get_rls_model(int id, float *a, float *b);
+    void enable_rls(int id, bool enabled = true);
     //モーター動かさずにプログラム内の角度のみ変更
     void force_set_angle(int id, float new_angle = 0.0f);
 
@@ -48,6 +56,7 @@ private:
     float pid_calculate(int id, float target, float current, float dt);
     float pos_pid_calculate(int id, float target, float current, float dt, float limit);
     void parse_can_data(int id, const CANMessage &msg, short *rotation, short *speed);
+    void rls_update(int id, float speed_rpm, float current_raw);
 
     CAN &_can;
     bool _motor_type;
@@ -60,6 +69,19 @@ private:
     float _target_angles[8];
     int _output_torques[8];
     int _torque_limits[8];
+    int _measured_currents[8];
+
+    struct RLSState {
+        // theta[0] = a, theta[1] = b
+        float a;
+        float b;
+        float p00, p01, p10, p11;
+        float prev_speed_rpm;
+        float prev_current_scaled;
+        bool initialized;
+        bool enabled;
+        unsigned long samples;
+    } _rls_states[8];
 
     float _kp, _ki, _kd;
     float _kp_p, _ki_p, _kd_p;
