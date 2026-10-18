@@ -20,6 +20,19 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
         _target_torques[i] = 0;
         _target_angles[i] = 0.0f;
         _output_torques[i] = 0;
+        _measured_currents[i] = 0;
+
+        _rls_states[i].a = 0.98f;
+        _rls_states[i].b = 0.0f;
+        _rls_states[i].p00 = 1000.0f;
+        _rls_states[i].p01 = 0.0f;
+        _rls_states[i].p10 = 0.0f;
+        _rls_states[i].p11 = 1000.0f;
+        _rls_states[i].prev_speed_rpm = 0.0f;
+        _rls_states[i].prev_current_scaled = 0.0f;
+        _rls_states[i].initialized = false;
+        _rls_states[i].enabled = false;
+        _rls_states[i].samples = 0;
         
         _pid_states[i].prev_err = 0.0f;
         _pid_states[i].integral = 0.0f;
@@ -204,6 +217,10 @@ void rbms::control_thread_entry() {
                 
                 int final_out = 0;
                 float current_rpm = _motor_type ? (raw_spd / 19.2f) : (raw_spd / 36.0f);
+                // DJI ESCフィードバックの電流フィールド（data[4..5]）
+                const int16_t raw_current = (int16_t)(((uint16_t)(uint8_t)local_msg.data[4] << 8) |
+                                                       (uint8_t)local_msg.data[5]);
+                rls_update(id, current_rpm, (float)raw_current);
 
                 if (mode == POS_MODE || mode == SPD_MODE) {
                     float limit = (_pid_states[id].speed_limit_rpm > 0.0f) ? 
@@ -319,6 +336,106 @@ int rbms::rbms_send() {
     if (send_high) success = success && _can.write(_tx_msg_high);
 
     return success ? 1 : -1;
+}
+
+int rbms::get_current(int id) {
+    if (id < 0 || id >= _motor_num) return 0;
+    _data_mutex.lock();
+    int value = _measured_currents[id];
+    _data_mutex.unlock();
+    return value;
+}
+
+void rbms::enable_rls(int id, bool enabled) {
+    if (id < 0 || id >= _motor_num) return;
+    _data_mutex.lock();
+    RLSState &s = _rls_states[id];
+    s.enabled = enabled;
+    s.initialized = false;
+    s.samples = 0;
+    s.a = 0.98f;
+    s.b = 0.0f;
+    s.p00 = 1000.0f;
+    s.p01 = 0.0f;
+    s.p10 = 0.0f;
+    s.p11 = 1000.0f;
+    _data_mutex.unlock();
+}
+
+bool rbms::get_rls_model(int id, float *a, float *b) {
+    if (id < 0 || id >= _motor_num || a == nullptr || b == nullptr) return false;
+    _data_mutex.lock();
+    const RLSState &s = _rls_states[id];
+    bool valid = s.enabled && s.samples >= 20;
+    if (valid) {
+        *a = s.a;
+        *b = s.b;
+    }
+    _data_mutex.unlock();
+    return valid;
+}
+
+// 逐次最小二乗法で、速度[k] = a*速度[k-1] + b*(電流[k-1]/1000) を推定する。
+// 電流はESCから受け取る生値を1000で正規化する。これはモデル同定であり、
+// この推定値だけでPID/LQRゲインを自動変更することはしない。
+void rbms::rls_update(int id, float speed_rpm, float current_raw) {
+    _data_mutex.lock();
+    _measured_currents[id] = (int)current_raw;
+    RLSState &s = _rls_states[id];
+    if (!s.enabled) {
+        _data_mutex.unlock();
+        return;
+    }
+
+    const float current_scaled = current_raw / 1000.0f;
+    if (!s.initialized) {
+        s.prev_speed_rpm = speed_rpm;
+        s.prev_current_scaled = current_scaled;
+        s.initialized = true;
+        _data_mutex.unlock();
+        return;
+    }
+
+    // y = phi^T * theta + error, phi = [previous speed, previous current]
+    const float phi0 = s.prev_speed_rpm;
+    const float phi1 = s.prev_current_scaled;
+    const float lambda = 0.995f; // 忘却係数。1に近いほど過去のデータを長く保持
+    const float pphi0 = s.p00 * phi0 + s.p01 * phi1;
+    const float pphi1 = s.p10 * phi0 + s.p11 * phi1;
+    const float denom = lambda + phi0 * pphi0 + phi1 * pphi1;
+
+    if (denom > 1.0e-6f && std::isfinite(denom)) {
+        const float k0 = pphi0 / denom;
+        const float k1 = pphi1 / denom;
+        const float prediction = s.a * phi0 + s.b * phi1;
+        const float error = speed_rpm - prediction;
+
+        s.a += k0 * error;
+        s.b += k1 * error;
+
+        const float old00 = s.p00, old01 = s.p01;
+        const float old10 = s.p10, old11 = s.p11;
+        s.p00 = (old00 - k0 * (phi0 * old00 + phi1 * old10)) / lambda;
+        s.p01 = (old01 - k0 * (phi0 * old01 + phi1 * old11)) / lambda;
+        s.p10 = (old10 - k1 * (phi0 * old00 + phi1 * old10)) / lambda;
+        s.p11 = (old11 - k1 * (phi0 * old01 + phi1 * old11)) / lambda;
+
+        // 異常値が制御器に伝播しないよう、非有限値なら推定器を再初期化
+        if (!std::isfinite(s.a) || !std::isfinite(s.b) ||
+            !std::isfinite(s.p00) || !std::isfinite(s.p01) ||
+            !std::isfinite(s.p10) || !std::isfinite(s.p11)) {
+            s.a = 0.98f; s.b = 0.0f;
+            s.p00 = 1000.0f; s.p01 = 0.0f;
+            s.p10 = 0.0f; s.p11 = 1000.0f;
+            s.samples = 0;
+        } else if (s.samples < 1000000UL) {
+            ++s.samples;
+        }
+    }
+
+    s.prev_speed_rpm = speed_rpm;
+    s.prev_current_scaled = current_scaled;
+    _data_mutex.unlock();
 }
 
 void rbms::parse_can_data(int id, const CANMessage &msg, short *rotation, short *speed) {
