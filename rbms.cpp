@@ -22,18 +22,39 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
         _output_torques[i] = 0;
         _measured_currents[i] = 0;
 
-        _rls_states[i].a = 0.98f;
-        _rls_states[i].b = 0.0f;
-        _rls_states[i].p00 = 1000.0f;
-        _rls_states[i].p01 = 0.0f;
-        _rls_states[i].p10 = 0.0f;
-        _rls_states[i].p11 = 1000.0f;
-        _rls_states[i].prev_speed_rpm = 0.0f;
-        _rls_states[i].prev_current_scaled = 0.0f;
-        _rls_states[i].initialized = false;
-        _rls_states[i].enabled = false;
-        _rls_states[i].samples = 0;
-        
+        RLSState &rs = _rls_states[i];
+        rs.a = 0.98f;
+        rs.b = 0.0f;//内部では速度・電流を正規化したモデルの定数
+        rs.p00 = 1000.0f;
+        rs.p10 = 0.0f;
+        rs.p11 = 1000.0f;
+        rs.prev_speed_scaled = 0.0f;
+        rs.prev_current_scaled = 0.0f;
+        rs.initialized = false;
+        rs.enabled = false;
+        rs.numerical_valid = true;
+        rs.samples = 0;
+        rs.rmse_initialized = true;
+        rs.samples = 0;
+        rs.rmse_ema_sq = 0.0f;
+        rs.rmse_initialized = false;
+        rs.current_mean_scaled = 0.0f;
+        rs.current_var_ema_scaled = 0.0f;
+        rs.excitation_samples = 0;
+        rs.stability_anchor_a = rs.a;
+        rs.stability_anchor_b = rs.b;
+        rs.last_delta_a = 0.0f;
+        rs.last_delta_b = 0.0f;
+        rs.stability_window_samples = 0;
+        rs.stable_windows = 0;
+        rs.coefficients_stable = false;
+        rs.last_error_rpm = 0.0f;
+        rs.min_valid_samples = 200;
+        rs.max_rmse_rpm = 50.0f;
+        rs.min_current_std_raw = 50.0f;
+        rs.max_data_age_ms = 50;
+        rs.last_update_timer.start();
+
         _pid_states[i].prev_err = 0.0f;
         _pid_states[i].integral = 0.0f;
         _pid_states[i].pos_prev_err = 0.0f;
@@ -55,6 +76,7 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
     for(int i = 0; i < 8; i++){
         _torque_limits[i] = 10000;
     }
+    _new_data_mask = 0;
 }
 
 void rbms::set_control_mode(int id, ControlMode mode) {
@@ -217,9 +239,8 @@ void rbms::control_thread_entry() {
                 
                 int final_out = 0;
                 float current_rpm = _motor_type ? (raw_spd / 19.2f) : (raw_spd / 36.0f);
-                // DJI ESCフィードバックの電流フィールド（data[4..5]）
-                const int16_t raw_current = (int16_t)(((uint16_t)(uint8_t)local_msg.data[4] << 8) |
-                                                       (uint8_t)local_msg.data[5]);
+                // ESCフィードバックの電流フィールド（data[4..5]）
+                const int16_t raw_current = (int16_t)(((uint16_t)(uint8_t)local_msg.data[4] << 8) |(uint8_t)local_msg.data[5]);
                 rls_update(id, current_rpm, (float)raw_current);
 
                 if (mode == POS_MODE || mode == SPD_MODE) {
@@ -352,6 +373,7 @@ void rbms::enable_rls(int id, bool enabled) {
     RLSState &s = _rls_states[id];
     s.enabled = enabled;
     s.initialized = false;
+    s.numerical_valid = true;
     s.samples = 0;
     s.a = 0.98f;
     s.b = 0.0f;
@@ -359,88 +381,312 @@ void rbms::enable_rls(int id, bool enabled) {
     s.p01 = 0.0f;
     s.p10 = 0.0f;
     s.p11 = 1000.0f;
+
+    s.prev_speed_scaled = 0.0f;
+    s.prev_current_scaled = 0.0f;
+    s.rmse_ema_sq = 0.0f;
+    s.rmse_initialized = false;
+    s.current_mean_scaled = 0.0f;
+    s.current_var_ema_scaled = 0.0f;
+    s.excitation_samples = 0;
+
+    s.stability_anchor_a = s.a;
+    s.stability_anchor_b = s.b;
+    s.last_delta_b = 0.0f;
+    s.last_delta_a = 0.0f;
+    s.stability_window_samples = 0;
+    s.stable_windows = 0;
+    s.coefficients_stable = false;
+    s.last_error_rpm = 0.0f;
+    s.last_update_timer.reset();
+    
     _data_mutex.unlock();
+}
+
+void rbms::set_rls_validation_limits(int id, uint32_t min_samples, float max_rmse_rpm, float min_current_std_raw, uint32_t max_data_age_ms){
+    if(id < 0 || id>= _motor_num) return;
+    if(min_samples < 1 || !std::isfinite(max_rmse_rpm) || max_rmse_rpm <= 0.0f || !std::isfinite(min_current_std_raw) || min_current_std_raw < 0.0f || max_data_age_ms == 0){
+        return;
+    }
+    _data_mutex.lock();
+    RLSState &s = _rls_states[id];
+        s.min_valid_samples = min_samples;
+    s.max_rmse_rpm = max_rmse_rpm;
+    s.min_current_std_raw = min_current_std_raw;
+    s.max_data_age_ms = max_data_age_ms;
+    _data_mutex.unlock();
+}
+
+bool rbms::get_rls_diagnostics(int id, RLSDiagnostics *out) {
+    if (id < 0 || id >= _motor_num || out == nullptr) return false;
+
+    _data_mutex.lock();
+    RLSState &s = _rls_states[id];
+
+    out->enabled = s.enabled;
+    out->numerical_ok = s.numerical_valid &&
+        std::isfinite(s.a) && std::isfinite(s.b) &&
+        std::isfinite(s.p00) && std::isfinite(s.p01) &&
+        std::isfinite(s.p10) && std::isfinite(s.p11) &&
+        std::isfinite(s.rmse_ema_sq) && s.rmse_ema_sq >= 0.0f &&
+        std::isfinite(s.current_mean_scaled) &&
+        std::isfinite(s.current_var_ema_scaled) && s.current_var_ema_scaled >= 0.0f &&
+        std::isfinite(s.last_error_rpm) &&
+        s.p00 > 0.0f && s.p11 > 0.0f &&
+        (s.p00 * s.p11 - s.p01 * s.p10) > 0.0f;
+    out->samples = s.samples;
+    out->a = s.a;
+    // 内部速度をRPM/1000に正規化しているため、APIでは元のRPMモデルのbに戻す。
+    out->b = s.b * 1000.0f;
+    out->rmse_rpm = s.rmse_initialized
+        ? std::sqrt((s.rmse_ema_sq > 0.0f) ? s.rmse_ema_sq : 0.0f) * 1000.0f
+        : std::numeric_limits<float>::infinity();
+    out->last_error_rpm = s.last_error_rpm;
+    out->coefficient_delta_a = s.last_delta_a;
+    out->coefficient_delta_b = s.last_delta_b * 1000.0f; // APIのb単位に換算
+
+    // 直近の入力変動を反映する指数移動分散から標準偏差を算出。
+    const float current_var = (s.current_var_ema_scaled > 0.0f)
+        ? s.current_var_ema_scaled : 0.0f;
+    out->current_std_raw = std::sqrt(current_var) * 1000.0f;
+
+    const int age_ms = s.last_update_timer.read_ms();
+    out->last_update_age_ms = (age_ms >= 0)
+        ? static_cast<uint32_t>(age_ms)
+        : UINT32_MAX;
+
+    out->sample_count_ok = s.samples >= s.min_valid_samples;
+    out->rmse_ok = s.rmse_initialized &&
+        std::isfinite(out->rmse_rpm) && out->rmse_rpm <= s.max_rmse_rpm;
+    out->coefficients_stable = s.coefficients_stable;
+    out->input_excitation_ok = s.excitation_samples >= s.min_valid_samples &&
+        std::isfinite(out->current_std_raw) &&
+        out->current_std_raw >= s.min_current_std_raw;
+    out->data_fresh = age_ms >= 0 &&
+        static_cast<uint32_t>(age_ms) <= s.max_data_age_ms;
+
+    out->valid = out->enabled && out->numerical_ok &&
+        out->sample_count_ok && out->rmse_ok &&
+        out->coefficients_stable && out->input_excitation_ok &&
+        out->data_fresh;
+
+    _data_mutex.unlock();
+    return true; // 診断情報を取得できた。モデルの有効性は out->valid を確認する。
 }
 
 bool rbms::get_rls_model(int id, float *a, float *b) {
     if (id < 0 || id >= _motor_num || a == nullptr || b == nullptr) return false;
     _data_mutex.lock();
     const RLSState &s = _rls_states[id];
-    bool valid = s.enabled && s.samples >= 20;
+
+        bool numerical_ok = s.numerical_valid &&
+        std::isfinite(s.a) && std::isfinite(s.b) &&
+        std::isfinite(s.p00) && std::isfinite(s.p01) &&
+        std::isfinite(s.p10) && std::isfinite(s.p11) &&
+        std::isfinite(s.rmse_ema_sq) && s.rmse_ema_sq >= 0.0f &&
+        std::isfinite(s.current_mean_scaled) &&
+        std::isfinite(s.current_var_ema_scaled) && s.current_var_ema_scaled >= 0.0f &&
+        std::isfinite(s.last_error_rpm) &&
+        s.p00 > 0.0f && s.p11 > 0.0f &&
+        (s.p00 * s.p11 - s.p01 * s.p10) > 0.0f;
+
+    float rmse_rpm = s.rmse_initialized
+        ? std::sqrt((s.rmse_ema_sq > 0.0f) ? s.rmse_ema_sq : 0.0f) * 1000.0f
+        : std::numeric_limits<float>::infinity();
+
+    const float current_var = (s.current_var_ema_scaled > 0.0f)
+        ? s.current_var_ema_scaled : 0.0f;
+    const float current_std_raw = std::sqrt(current_var) * 1000.0f;
+
+    const int age_ms = s.last_update_timer.read_ms();
+    bool valid = s.enabled && numerical_ok &&
+        s.samples >= s.min_valid_samples &&
+        s.rmse_initialized && std::isfinite(rmse_rpm) &&
+        rmse_rpm <= s.max_rmse_rpm &&
+        s.coefficients_stable &&
+        s.excitation_samples >= s.min_valid_samples &&
+        std::isfinite(current_std_raw) &&
+        current_std_raw >= s.min_current_std_raw &&
+        age_ms >= 0 && static_cast<uint32_t>(age_ms) <= s.max_data_age_ms;
+
     if (valid) {
         *a = s.a;
-        *b = s.b;
+        // 内部モデル: speed_rpm/1000 = a*(prev_speed_rpm/1000)
+        //                              + b_internal*(current_raw/1000)
+        // 従来のAPIモデル: speed_rpm = a*prev_speed_rpm + b_api*(current_raw/1000)
+        *b = s.b * 1000.0f;
     }
+
     _data_mutex.unlock();
     return valid;
 }
 
-// 逐次最小二乗法で、速度[k] = a*速度[k-1] + b*(電流[k-1]/1000) を推定する。
-// 電流はESCから受け取る生値を1000で正規化する。これはモデル同定であり、
-// この推定値だけでPID/LQRゲインを自動変更することはしない。
 void rbms::rls_update(int id, float speed_rpm, float current_raw) {
+    if (id < 0 || id >= _motor_num ||
+        !std::isfinite(speed_rpm) || !std::isfinite(current_raw)) {
+        return;
+    }
+
     _data_mutex.lock();
-    _measured_currents[id] = (int)current_raw;
+    _measured_currents[id] = static_cast<int>(current_raw);
     RLSState &s = _rls_states[id];
-    if (!s.enabled) {
+    s.last_update_timer.reset();
+
+    if (!s.enabled || !s.numerical_valid) {
         _data_mutex.unlock();
         return;
     }
 
+    const float speed_scaled = speed_rpm / 1000.0f;
     const float current_scaled = current_raw / 1000.0f;
+
     if (!s.initialized) {
-        s.prev_speed_rpm = speed_rpm;
+        s.prev_speed_scaled = speed_scaled;
         s.prev_current_scaled = current_scaled;
         s.initialized = true;
         _data_mutex.unlock();
         return;
     }
 
-    // y = phi^T * theta + error, phi = [previous speed, previous current]
-    const float phi0 = s.prev_speed_rpm;
+    // phi = [前回の正規化速度, 前回の正規化電流]
+    const float phi0 = s.prev_speed_scaled;
     const float phi1 = s.prev_current_scaled;
-    const float lambda = 0.995f; // 忘却係数。1に近いほど過去のデータを長く保持
-    const float pphi0 = s.p00 * phi0 + s.p01 * phi1;
-    const float pphi1 = s.p10 * phi0 + s.p11 * phi1;
-    const float denom = lambda + phi0 * pphi0 + phi1 * pphi1;
+    const float lambda = 0.995f;
 
-    if (denom > 1.0e-6f && std::isfinite(denom)) {
-        const float k0 = pphi0 / denom;
-        const float k1 = pphi1 / denom;
-        const float prediction = s.a * phi0 + s.b * phi1;
-        const float error = speed_rpm - prediction;
+    // q = P * phi
+    const float q0 = s.p00 * phi0 + s.p01 * phi1;
+    const float q1 = s.p10 * phi0 + s.p11 * phi1;
+    const float denominator = lambda + phi0 * q0 + phi1 * q1;
 
-        s.a += k0 * error;
-        s.b += k1 * error;
+    if (!std::isfinite(denominator) || denominator <= 1.0e-9f) {
+        s.numerical_valid = false;
+        s.initialized = false;
+        _data_mutex.unlock();
+        return;
+    }
 
-        const float old00 = s.p00, old01 = s.p01;
-        const float old10 = s.p10, old11 = s.p11;
-        s.p00 = (old00 - k0 * (phi0 * old00 + phi1 * old10)) / lambda;
-        s.p01 = (old01 - k0 * (phi0 * old01 + phi1 * old11)) / lambda;
-        s.p10 = (old10 - k1 * (phi0 * old00 + phi1 * old10)) / lambda;
-        s.p11 = (old11 - k1 * (phi0 * old01 + phi1 * old11)) / lambda;
+    const float k0 = q0 / denominator;
+    const float k1 = q1 / denominator;
+    const float prediction_scaled = s.a * phi0 + s.b * phi1;
+    const float error_scaled = speed_scaled - prediction_scaled;
 
-        // 異常値が制御器に伝播しないよう、非有限値なら推定器を再初期化
-        if (!std::isfinite(s.a) || !std::isfinite(s.b) ||
-            !std::isfinite(s.p00) || !std::isfinite(s.p01) ||
-            !std::isfinite(s.p10) || !std::isfinite(s.p11)) {
-            s.a = 0.98f; s.b = 0.0f;
-            s.p00 = 1000.0f; s.p01 = 0.0f;
-            s.p10 = 0.0f; s.p11 = 1000.0f;
-            s.samples = 0;
-        } else if (s.samples < 1000000UL) {
-            ++s.samples;
+    // 係数の候補を作る。検査に通るまで現在の係数は変更しない。
+    const float a_candidate = s.a + k0 * error_scaled;
+    const float b_candidate = s.b + k1 * error_scaled;
+
+    const float old00 = s.p00;
+    const float old01 = s.p01;
+    const float old10 = s.p10;
+    const float old11 = s.p11;
+
+    const float p00_candidate =
+        (old00 - k0 * (phi0 * old00 + phi1 * old10)) / lambda;
+    const float p01_candidate =
+        (old01 - k0 * (phi0 * old01 + phi1 * old11)) / lambda;
+    const float p10_candidate =
+        (old10 - k1 * (phi0 * old00 + phi1 * old10)) / lambda;
+    const float p11_candidate =
+        (old11 - k1 * (phi0 * old01 + phi1 * old11)) / lambda;
+
+    const bool candidates_finite =
+        std::isfinite(a_candidate) && std::isfinite(b_candidate) &&
+        std::isfinite(p00_candidate) && std::isfinite(p01_candidate) &&
+        std::isfinite(p10_candidate) && std::isfinite(p11_candidate) &&
+        p00_candidate > 0.0f && p11_candidate > 0.0f &&
+        (p00_candidate * p11_candidate - p01_candidate * p10_candidate) > 0.0f;
+
+    if (!candidates_finite) {
+        s.numerical_valid = false;
+        s.initialized = false;
+        _data_mutex.unlock();
+        return;
+    }
+
+    // 係数・共分散行列を確定
+    s.a = a_candidate;
+    s.b = b_candidate;
+    s.p00 = p00_candidate;
+    s.p11 = p11_candidate;
+    const float off_diagonal = 0.5f * (p01_candidate + p10_candidate);
+    s.p01 = off_diagonal;
+    s.p10 = off_diagonal;
+
+    // 予測RMSEを指数移動平均で記録（speed_scaled単位なのでgetterでRPMへ変換）。
+    // alpha=0.05は初期値。応答性とノイズをログで確認して調整する。
+    const float error_sq = error_scaled * error_scaled;
+    const float rmse_alpha = 0.05f;
+    if (!s.rmse_initialized) {
+        s.rmse_ema_sq = error_sq;
+        s.rmse_initialized = true;
+    } else {
+        s.rmse_ema_sq = (1.0f - rmse_alpha) * s.rmse_ema_sq
+                      + rmse_alpha * error_sq;
+    }
+    s.last_error_rpm = error_scaled * 1000.0f;
+
+    // 入力電流の直近の変動を指数移動分散で追跡する。
+    // 古い変動だけで後々まで「励起あり」と判定し続けないようにする。
+    const float variance_alpha = 0.05f;
+    if (s.excitation_samples == 0) {
+        s.current_mean_scaled = phi1;
+        s.current_var_ema_scaled = 0.0f;
+        s.excitation_samples = 1;
+    } else {
+        const float delta = phi1 - s.current_mean_scaled;
+        s.current_mean_scaled += variance_alpha * delta;
+        const float delta_after = phi1 - s.current_mean_scaled;
+        s.current_var_ema_scaled =
+            (1.0f - variance_alpha) * s.current_var_ema_scaled +
+            variance_alpha * delta * delta_after;
+        if (s.current_var_ema_scaled < 0.0f) {
+            // 浮動小数点誤差による微小な負値を防ぐ
+            s.current_var_ema_scaled = 0.0f;
+        }
+        if (s.excitation_samples < UINT32_MAX) {
+            ++s.excitation_samples;
         }
     }
 
-    s.prev_speed_rpm = speed_rpm;
+    if (s.samples < UINT32_MAX) {
+        ++s.samples;
+    }
+
+    // 係数安定性を25回ごとに判定し、3区間連続で安定している場合にtrue。
+    ++s.stability_window_samples;
+    if (s.stability_window_samples >= 25) {
+        const float delta_a = std::fabs(s.a - s.stability_anchor_a);
+        const float delta_b = std::fabs(s.b - s.stability_anchor_b);
+        s.last_delta_a = delta_a;
+        s.last_delta_b = delta_b;
+        float tolerance_b = 0.1f * std::fabs(s.stability_anchor_b);
+        if (tolerance_b < 0.0001f) tolerance_b = 0.0001f;
+
+        if (delta_a <= 0.02f && delta_b <= tolerance_b) {
+            if (s.stable_windows < 255) ++s.stable_windows;
+        } else {
+            s.stable_windows = 0;
+        }
+        s.coefficients_stable = (s.stable_windows >= 3);
+        s.stability_anchor_a = s.a;
+        s.stability_anchor_b = s.b;
+        s.stability_window_samples = 0;
+    }
+
+    s.prev_speed_scaled = speed_scaled;
     s.prev_current_scaled = current_scaled;
     _data_mutex.unlock();
 }
 
+
 void rbms::parse_can_data(int id, const CANMessage &msg, short *rotation, short *speed) {
-    uint16_t raw_angle = (msg.data[0] << 8) | (msg.data[1] & 0xff);
-    *speed = (int16_t)((msg.data[2] << 8) | (msg.data[3] & 0xff));
+    const uint8_t b0 = static_cast<uint8_t>(msg.data[0]);
+    const uint8_t b1 = static_cast<uint8_t>(msg.data[1]);
+    const uint8_t b2 = static_cast<uint8_t>(msg.data[2]);
+    const uint8_t b3 = static_cast<uint8_t>(msg.data[3]);
+    const uint16_t raw_angle =
+        (static_cast<uint16_t>(b0) << 8) | static_cast<uint16_t>(b1);
+    *speed = static_cast<int16_t>(
+        (static_cast<uint16_t>(b2) << 8) | static_cast<uint16_t>(b3));
 
     _data_mutex.lock();
 
@@ -466,6 +712,9 @@ void rbms::parse_can_data(int id, const CANMessage &msg, short *rotation, short 
 
 //修正:_id_offset を考慮して受信メッセージの該当ローカルインデックスを計算
 bool rbms::handle_message(const CANMessage &msg) {
+    // DJI ESCのフィードバックは8バイト想定。短いフレームをRLS/PIDに渡さない。
+    if (msg.len != 8) return false;
+
     int global_idx = msg.id - 0x201; // 例: 0x205 -> global_idx = 4
     int local_idx = global_idx - _id_offset; // 例: 4 - 4 = local_idx 0
 
