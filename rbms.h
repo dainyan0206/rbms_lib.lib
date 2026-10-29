@@ -25,6 +25,7 @@ public:
     void set_speed_limit(int id, float max_speed);
     void set_accel_limit(int id, float max_accel);
     void set_torque_limit(int id, int max_torque);
+    void set_gear_ratio(int id, float gear_ratio);
 
     bool handle_message(const CANMessage &msg) override;
     void spd_control();
@@ -60,6 +61,7 @@ private:
     float _target_angles[8];
     int _output_torques[8];
     int _torque_limits[8];
+    float _gear_ratios[8];
 
     float _kp, _ki, _kd;
     float _kp_p, _ki_p, _kd_p;
