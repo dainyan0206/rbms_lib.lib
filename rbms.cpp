@@ -357,7 +357,7 @@ void rbms::parse_can_data(int id, const CANMessage &msg, short *rotation, short 
     _pid_states[id].last_raw_angle = raw_angle;
 
     float gear_ratio = _gear_ratios[id];
-    _pid_states[id].accumulated_angle +=　((float)diff / 8192.0f) * 360.0f / gear_ratio;
+    _pid_states[id].accumulated_angle += ((float)diff / 8192.0f) * 360.0f / gear_ratio;
 
     _data_mutex.unlock();
 
