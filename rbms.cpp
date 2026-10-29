@@ -20,6 +20,7 @@ rbms::rbms(CAN &can, bool motor_type, int motor_num, int id_offset)
         _target_torques[i] = 0;
         _target_angles[i] = 0.0f;
         _output_torques[i] = 0;
+        _gear_ratios[i] = _motor_type ? 19.2f : 36.0f;
         
         _pid_states[i].prev_err = 0.0f;
         _pid_states[i].integral = 0.0f;
@@ -66,6 +67,15 @@ void rbms::set_target_torque(int id, int torque) {
     if (id < 0 || id >= _motor_num) return;
     _data_mutex.lock();
     _target_torques[id] = torque;
+    _data_mutex.unlock();
+}
+
+void rbms::set_gear_ratio(int id, float gear_ratio) {
+    if (id < 0 || id >= _motor_num) return;
+    if (gear_ratio <= 0.0f) return;
+
+    _data_mutex.lock();
+    _gear_ratios[id] = gear_ratio;
     _data_mutex.unlock();
 }
 
@@ -203,8 +213,15 @@ void rbms::control_thread_entry() {
                 parse_can_data(id, local_msg, &rot, &raw_spd); 
                 
                 int final_out = 0;
-                float current_rpm = _motor_type ? (raw_spd / 19.2f) : (raw_spd / 36.0f);
 
+                float gear_ratio;
+
+                _data_mutex.lock();
+                gear_ratio = _gear_ratios[id];
+                _data_mutex.unlock();
+
+                float current_rpm = raw_spd / gear_ratio;
+                
                 if (mode == POS_MODE || mode == SPD_MODE) {
                     float limit = (_pid_states[id].speed_limit_rpm > 0.0f) ? 
                                   _pid_states[id].speed_limit_rpm : 
@@ -339,8 +356,8 @@ void rbms::parse_can_data(int id, const CANMessage &msg, short *rotation, short 
 
     _pid_states[id].last_raw_angle = raw_angle;
 
-    float gear_ratio = _motor_type ? 19.2f : 36.0f;
-    _pid_states[id].accumulated_angle += ((float)diff / 8192.0f) * 360.0f / gear_ratio;
+    float gear_ratio = _gear_ratios[id];
+    _pid_states[id].accumulated_angle +=　((float)diff / 8192.0f) * 360.0f / gear_ratio;
 
     _data_mutex.unlock();
 
